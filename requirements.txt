@@ -1,0 +1,7 @@
+# QR Code Steganography Generator - Dependencies
+# Install with: pip install -r requirements.txt
+
+qrcode[art]<2.0
+Pillow>=9.0,<11.0
+PyQt6>=6.4
+numpy>=1.21.0
