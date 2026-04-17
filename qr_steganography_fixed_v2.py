@@ -87,8 +87,12 @@ class PreviewWidget(QLabel):
         super().mouseReleaseEvent(event)
     
     def wheelEvent(self, event):
-        """Handle mouse wheel - zoom in/out."""
+        """
+        Handle mouse wheel - zoom in/out.
+        Must explicitly accept event for PyQt6 to deliver it to this widget.
+        """
         if not self.interactive_mode:
+            # Not in interactive mode - let default Qt handling occur
             super().wheelEvent(event)
             return
         
@@ -98,6 +102,11 @@ class PreviewWidget(QLabel):
             self.scale_changed.emit(1.1)  # Scale factor to multiply by
         else:  # Scroll down - zoom out (decrease scale)
             self.scale_changed.emit(0.9)  # Scale factor to multiply by
+        
+        # IMPORTANT: Accept the event so it doesn't bubble up to parent window
+        # This prevents Qt from doing default scroll behavior and ensures
+        # our signal is processed correctly
+        event.accept()
 
 
 class QRCodeProcessor:
@@ -112,15 +121,6 @@ class QRCodeProcessor:
     def generate_qr_code(self, data: str, version: int = 7, error_correction: str = 'H') -> Image.Image:
         """
         Generate a QR code image.
-        
-        Args:
-            data: The content to encode in the QR code
-            version: QR code version (1-40), affects module count and size
-            error_correction: Error correction level ('L', 'M', 'Q', 'H')
-                          H = High, can recover ~30% of damaged data
-        
-        Returns:
-            PIL Image containing the generated QR code
         """
         # Map error correction level to constant
         ec_map = {
@@ -157,35 +157,15 @@ class QRCodeProcessor:
         resized_qr = self.qr_image.resize((qr_size, new_height), Image.Resampling.LANCZOS)
         return resized_qr
     
-    def create_mask_from_image(self, image: Image.Image, threshold: float = 0.5) -> Image.Image:
-        """
-        Create a binary mask from an RGB image.
-        Pixels above the brightness threshold become white (QR visible).
-        Pixels below become black (image shows through).
-        
-        Args:
-            image: The source image
-            threshold: Brightness threshold (0.0-1.0)
-            
-        Returns:
-            Binary mask image (black and white)
-        """
-        gray = image.convert('L')
-        threshold_value = int(255 * threshold)
-        
-        mask_array = np.array(gray)
-        mask_array[mask_array > threshold_value] = 255
-        mask_array[mask_array <= threshold_value] = 0
-        
-        return Image.fromarray(mask_array, mode='L')
-    
     def qr_over_image(self, qr_image: Image.Image, bg_image: Image.Image, 
                       resize_qr_to_bg: bool = True,
                       fade_factor: float = 0.15,
                       tint_intensity: float = 0.20,
                       bg_scale: float = 1.0,
                       bg_x_offset: int = 0,
-                      bg_y_offset: int = 0) -> Image.Image:
+                      bg_y_offset: int = 0,
+                      bg_original_width: int = 0,
+                      bg_original_height: int = 0) -> Image.Image:
         """
         Place QR code OVER the background image with smart blending.
         
@@ -193,15 +173,7 @@ class QRCodeProcessor:
         - Background is FADED (fade_factor visibility) - subtle watermark
         - Black QR modules are SOLID dark colors tinted toward background  
         - White QR modules remain WHITE or very light
-        
-        This creates HIGH contrast while still visually integrating with the image.
-        Result size matches QR code size to prevent any cropping.
-        
-        Args:
-            qr_image: The QR code PIL Image
-            bg_image: Background image to blend with
-            resize_qr_to_bg: Whether to resize QR to match background width
-            fade_factor: Background visibility (0.0 = invisible, 1.0 = full opacity)
+        - Background can be scaled and positioned by user
         """
         bg_width, bg_height = bg_image.size
         qr_width, qr_height = qr_image.size
@@ -213,8 +185,8 @@ class QRCodeProcessor:
             qr_width, qr_height = qr_image.size
         else:
             # Apply scale factor to background (for interactive zoom)
-            scaled_w = int(bg_width * bg_scale)
-            scaled_h = int(bg_height * bg_scale)
+            scaled_w = int(bg_original_width * bg_scale) if bg_original_width > 0 else int(bg_width * bg_scale)
+            scaled_h = int(bg_original_height * bg_scale) if bg_original_height > 0 else int(bg_height * bg_scale)
             if scaled_w > 0 and scaled_h > 0:
                 bg_image = bg_image.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
             bg_width, bg_height = scaled_w, scaled_h
@@ -224,13 +196,21 @@ class QRCodeProcessor:
         qr_gray_array = np.array(qr_image.convert('L'))
         
         # Create result array with SAME SIZE as QR code (prevents cropping!)
-        # fade_factor is now passed as parameter - allows user to adjust via UI
         result_array = np.ones((qr_height, qr_width, 3), dtype=np.float32) * 255
         
         # Calculate offset for placing background on QR (for interactive positioning)
-        # Center the scaled background, then apply user offsets
-        x_offset = max(0, (qr_width - bg_width) // 2 + bg_x_offset)
-        y_offset = max(0, (qr_height - bg_height) // 2 + bg_y_offset)
+        # Use original dimensions to calculate base center position - prevents jumping when zooming!
+        if bg_original_width > 0 and bg_original_height > 0:
+            # Base position calculated from ORIGINAL size (fixed anchor point)
+            base_x = max(0, (qr_width - bg_original_width) // 2)
+            base_y = max(0, (qr_height - bg_original_height) // 2)
+        else:
+            # Fallback: center based on current scaled size
+            base_x = max(0, (qr_width - bg_width) // 2)
+            base_y = max(0, (qr_height - bg_height) // 2)
+        
+        x_offset = base_x + bg_x_offset
+        y_offset = base_y + bg_y_offset
         
         # Process WHITE modules: show faded background
         white_mask = qr_gray_array > 127
@@ -277,45 +257,47 @@ class QRCodeProcessor:
                                    tint_intensity: float = 0.20,
                                    bg_scale: float = 1.0,
                                    bg_x_offset: int = 0,
-                                   bg_y_offset: int = 0) -> Image.Image:
+                                   bg_y_offset: int = 0,
+                                   bg_original_width: int = 0,
+                                   bg_original_height: int = 0) -> Image.Image:
         """
         Place background image OVER the QR code with smart tinting.
         
         IMPROVED APPROACH for maximum scannability:
         - White QR modules show FADED background (fade_factor visibility)
         - Black QR modules are SOLID dark colors tinted toward background
-        
-        This maintains HIGH contrast while visually integrating with the image.
-        Result size matches QR code size to prevent any cropping.
-        
-        Args:
-            qr_image: The QR code PIL Image
-            bg_image: Background image to blend with
-            resize_bg_to_qr: Whether to resize background to match QR width
-            fade_factor: Background visibility (0.0 = invisible, 1.0 = full opacity)
+        - Background can be scaled and positioned by user
         """
         qr_width, qr_height = qr_image.size
         bg_width, bg_height = bg_image.size
         
         # Resize background to match QR size with scale factor
         if resize_bg_to_qr:
-            scaled_w = int(bg_width * bg_scale)
-            scaled_h = int(bg_height * bg_scale)
+            scaled_w = int(bg_original_width * bg_scale) if bg_original_width > 0 else int(bg_width * bg_scale)
+            scaled_h = int(bg_original_height * bg_scale) if bg_original_height > 0 else int(bg_height * bg_scale)
             if scaled_w > 0 and scaled_h > 0:
                 bg_image = bg_image.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
             bg_width, bg_height = scaled_w, scaled_h
         
         # Calculate offset for placing background on QR (for interactive positioning)
-        # Center the scaled background, then apply user offsets
-        x_offset = max(0, (qr_width - bg_width) // 2 + bg_x_offset)
-        y_offset = max(0, (qr_height - bg_height) // 2 + bg_y_offset)
+        # Use original dimensions to calculate base center position - prevents jumping when zooming!
+        if bg_original_width > 0 and bg_original_height > 0:
+            # Base position calculated from ORIGINAL size (fixed anchor point)
+            base_x = max(0, (qr_width - bg_original_width) // 2)
+            base_y = max(0, (qr_height - bg_original_height) // 2)
+        else:
+            # Fallback: center based on current scaled size
+            base_x = max(0, (qr_width - bg_width) // 2)
+            base_y = max(0, (qr_height - bg_height) // 2)
+        
+        x_offset = base_x + bg_x_offset
+        y_offset = base_y + bg_y_offset
         
         # Convert images to numpy arrays
         qr_gray_array = np.array(qr_image.convert('L'))
         bg_array = np.array(bg_image.convert('RGB')).astype(np.float32)
         
         # Create result array with SAME SIZE as QR code (prevents cropping!)
-        # fade_factor is now passed as parameter - allows user to adjust via UI
         result_array = np.ones((qr_height, qr_width, 3), dtype=np.float32) * 255
         
         # Process WHITE modules: show faded background
@@ -360,10 +342,6 @@ class QRCodeProcessor:
     def save_image(self, image: Image.Image, filepath):
         """
         Save the generated image to file or buffer.
-        
-        Args:
-            image: PIL Image to save
-            filepath: File path string or BytesIO buffer
         """
         if isinstance(filepath, io.BytesIO):
             # Saving to buffer - specify format explicitly
@@ -399,10 +377,13 @@ class MainWindow(QMainWindow):
         self.background_opacity = 0.15  # Default: 15% visible (85% white)
         self.tint_intensity = 0.20  # Default: 20% tint on black modules
         self.bg_scale_factor = 1.0   # Background zoom level (1.0 = original size)
-        self.bg_x_offset = 0          # Horizontal position offset
-        self.bg_y_offset = 0          # Vertical position offset
+        self.bg_x_offset = 0          # Horizontal position offset (absolute pixels)
+        self.bg_y_offset = 0          # Vertical position offset (absolute pixels)
+        self.bg_original_width = 0    # Original background width before scaling
+        self.bg_original_height = 0   # Original background height before scaling
         self.interactive_preview = False  # Enable interactive drag/zoom in preview
         self.preview_widget = None  # Custom PreviewWidget instance
+        self.current_qr_image = None  # Store generated QR for interactive preview
         self.setup_ui()
         
     def setup_ui(self):
@@ -542,16 +523,6 @@ class MainWindow(QMainWindow):
         filename_layout.addWidget(self.filename_input, stretch=1)
         bg_layout.addLayout(filename_layout)
         
-        # Background threshold (kept for compatibility, but opacity is primary control now)
-        threshold_layout = QHBoxLayout()
-        threshold_layout.addWidget(QLabel("Mask Threshold:"))
-        self.threshold_spin = QSpinBox()
-        self.threshold_spin.setRange(0, 100)
-        self.threshold_spin.setValue(50)
-        self.threshold_spin.setSuffix(" %")
-        threshold_layout.addWidget(self.threshold_spin)
-        bg_layout.addLayout(threshold_layout)
-        
         # Mode selection
         mode_layout = QHBoxLayout()
         self.mode_group = QButtonGroup()
@@ -621,27 +592,40 @@ class MainWindow(QMainWindow):
         """
         Signal handler: Update position when user drags in preview.
         Called by PreviewWidget.position_changed signal.
+        Only update if we have a valid QR code and background loaded.
         """
         self.bg_x_offset += delta_x
         self.bg_y_offset += delta_y
-        self.update_preview_with_positioning()
+        # Check that both QR image AND background are actually generated/loaded (not None)
+        if self.current_qr_image is not None and self.bg_image is not None:
+            self.update_preview_with_positioning()
     
     def on_preview_scale_changed(self, scale_multiplier):
         """
         Signal handler: Update scale when user scrolls wheel in preview.
         Called by PreviewWidget.scale_changed signal.
+        Only update if we have a valid QR code and background loaded.
+        Allows wider zoom range for fitting large/small backgrounds to QR area.
         """
         self.bg_scale_factor *= scale_multiplier
-        # Clamp to valid range
-        self.bg_scale_factor = max(0.3, min(2.0, self.bg_scale_factor))
-        self.update_preview_with_positioning()
+        # Clamp to valid range - allow more zoom in/out flexibility
+        # Min 0.1x (very small), Max 5.0x (can fill large QR areas)
+        self.bg_scale_factor = max(0.1, min(5.0, self.bg_scale_factor))
+        # Check that both QR image AND background are actually generated/loaded (not None)
+        if self.current_qr_image is not None and self.bg_image is not None:
+            self.update_preview_with_positioning()
     
     def update_preview_with_positioning(self):
         """
         Update the preview with current positioning settings.
         Called after drag or zoom operations.
+        
+        Always uses fixed sizing (no auto-resize) to maintain consistent
+        positioning as user drags/zooms the background.
+        Only proceed if both QR code and background are actually generated.
         """
-        if not hasattr(self, 'current_qr_image') or self.bg_image is None:
+        # Guard: Don't process if QR or background is None
+        if self.current_qr_image is None or self.bg_image is None:
             return
         
         # Get current mode and regenerate with positioning
@@ -651,33 +635,40 @@ class MainWindow(QMainWindow):
         if self.mode_over.isChecked():
             result = self.processor.qr_over_image(
                 self.current_qr_image, self.bg_image,
-                resize_qr_to_bg=False,  # Don't auto-resize - we handle positioning
+                resize_qr_to_bg=False,  # Don't auto-resize - maintain fixed QR size for positioning
                 fade_factor=fade_factor,
                 tint_intensity=tint_intensity,
                 bg_scale=self.bg_scale_factor,
                 bg_x_offset=self.bg_x_offset,
-                bg_y_offset=self.bg_y_offset
+                bg_y_offset=self.bg_y_offset,
+                bg_original_width=self.bg_original_width,
+                bg_original_height=self.bg_original_height
             )
         else:
             result = self.processor.image_over_qr_with_tinting(
                 self.current_qr_image, self.bg_image,
-                resize_bg_to_qr=False,  # Don't auto-resize - we handle positioning
+                resize_bg_to_qr=False,  # Don't auto-resize - maintain fixed QR size for positioning
                 fade_factor=fade_factor,
                 tint_intensity=tint_intensity,
                 bg_scale=self.bg_scale_factor,
                 bg_x_offset=self.bg_x_offset,
-                bg_y_offset=self.bg_y_offset
+                bg_y_offset=self.bg_y_offset,
+                bg_original_width=self.bg_original_width,
+                bg_original_height=self.bg_original_height
             )
         
         self.current_result = result
-        pixmap = self.image_to_pixmap(result)
-        scaled_pixmap = pixmap.scaled(500, 500, Qt.AspectRatioMode.KeepAspectRatio)
+        
+        # Update preview widget with result
         if self.preview_widget:
+            pixmap = self.image_to_pixmap(result)
+            scaled_pixmap = pixmap.scaled(500, 500, Qt.AspectRatioMode.KeepAspectRatio)
             self.preview_widget.setPixmap(scaled_pixmap)
     
     def load_background_image(self):
         """
         Load a background image from file dialog.
+        Also stores original dimensions for consistent positioning during zoom.
         """
         filepath, _ = QFileDialog.getOpenFileName(
             self,
@@ -690,11 +681,21 @@ class MainWindow(QMainWindow):
             try:
                 self.bg_image = Image.open(filepath)
                 self.bg_image = self.bg_image.convert('RGB')
+                # Store original dimensions for consistent positioning
+                self.bg_original_width, self.bg_original_height = self.bg_image.size
                 
-                # Show preview
+                # Show background preview
                 pixmap = self.image_to_pixmap(self.bg_image)
                 scaled_pixmap = pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio)
                 self.bg_label.setPixmap(scaled_pixmap)
+                
+                # Also show in main preview if QR code is ready
+                if hasattr(self, 'current_qr_image') and self.current_qr_image is not None:
+                    self.generate_qr_code()
+                else:
+                    # Just show the background image in preview for now
+                    if self.preview_widget:
+                        self.preview_widget.setPixmap(pixmap.scaled(500, 500, Qt.AspectRatioMode.KeepAspectRatio))
                 
                 QMessageBox.information(self, "Success", f"Image loaded: {filepath}")
             except Exception as e:
@@ -720,9 +721,18 @@ class MainWindow(QMainWindow):
                     pixels[x, y] = (218, 165, 32)  # Orange cat color
         
         self.bg_image = img
+                
+        # Store original dimensions for consistent positioning
+        self.bg_original_width, self.bg_original_height = img.size
+            
+        # Show background preview in main preview area if QR code already generated
         pixmap = self.image_to_pixmap(img)
         scaled_pixmap = pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio)
         self.bg_label.setPixmap(scaled_pixmap)
+        
+        # Also show in main preview if QR code is ready
+        if hasattr(self, 'current_qr_image') and self.current_qr_image is not None:
+            self.generate_qr_code()
     
     def image_to_pixmap(self, image: Image.Image) -> QPixmap:
         """
@@ -748,6 +758,7 @@ class MainWindow(QMainWindow):
     def generate_qr_code(self):
         """
         Generate the QR code with steganography effects.
+        Also shows preview immediately when background is loaded.
         """
         # Get input data
         url_text = self.url_input.text().strip()
@@ -785,92 +796,47 @@ class MainWindow(QMainWindow):
         
         # Apply steganography mode
         if self.bg_image is not None:
-            threshold = self.threshold_spin.value() / 100.0
-            fade_factor = self.background_opacity  # Use slider value (from opacity_slider)
-            tint_intensity = self.tint_intensity   # Use slider value (from tint_slider)
+            fade_factor = self.background_opacity  # Background visibility (0-75%)
+            tint_intensity = self.tint_intensity   # Tint on black modules (0-75%)
             
             if self.mode_over.isChecked():
                 # QR code OVER background (invisibility cloak style)
                 result = self.processor.qr_over_image(
                     qr_image, self.bg_image,
-                    resize_qr_to_bg=True,  # Auto-resize for final output
+                    resize_qr_to_bg=True,   # Resize QR to match background - better default
                     fade_factor=fade_factor,
                     tint_intensity=tint_intensity,
                     bg_scale=self.bg_scale_factor,
                     bg_x_offset=self.bg_x_offset,
-                    bg_y_offset=self.bg_y_offset
+                    bg_y_offset=self.bg_y_offset,
+                    bg_original_width=self.bg_original_width,
+                    bg_original_height=self.bg_original_height
                 )
             else:
                 # Background image OVER QR code (tinted modules)
                 result = self.processor.image_over_qr_with_tinting(
                     qr_image, self.bg_image,
-                    resize_bg_to_qr=True,  # Auto-resize for final output
+                    resize_bg_to_qr=True,   # Resize background to match QR - better default
                     fade_factor=fade_factor,
                     tint_intensity=tint_intensity,
                     bg_scale=self.bg_scale_factor,
                     bg_x_offset=self.bg_x_offset,
-                    bg_y_offset=self.bg_y_offset
+                    bg_y_offset=self.bg_y_offset,
+                    bg_original_width=self.bg_original_width,
+                    bg_original_height=self.bg_original_height
                 )
         else:
             result = qr_image.convert('RGB')
         
         self.current_result = result
         self.current_qr_image = qr_image  # Store for interactive preview
-        # Get input data
-        url_text = self.url_input.text().strip()
-        if not url_text:
-            QMessageBox.warning(self, "Warning", "Please enter URL or content for the QR code")
-            return
         
-        # Extract error correction level from display text (e.g., "H - High..." -> "H")
-        ec_text = self.error_correction.currentText()
-        error_correction = ec_text.split(' ')[0] if ec_text else 'H'
-        qr_version = self.qr_version_spin.value()
-        
-        # Generate base QR code
-        try:
-            qr_image = self.processor.generate_qr_code(url_text, qr_version, error_correction)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to generate QR code: {e}")
-            return
-        
-        # Check if background image is loaded
-        if self.bg_image is None:
-            QMessageBox.warning(
-                self,
-                "Warning",
-                "No background image loaded. Generate a plain QR code?"
-            )
-            reply = QMessageBox.question(
-                self,
-                "Confirm",
-                "Generate plain QR code without background?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-        
-        # Apply steganography mode
-        if self.bg_image is not None:
-            threshold = self.threshold_spin.value() / 100.0
-            fade_factor = self.background_opacity  # Use slider value (from opacity_slider)
-            
-            if self.mode_over.isChecked():
-                # QR code OVER background (invisibility cloak style)
-                result = self.processor.qr_over_image(qr_image, self.bg_image, fade_factor=fade_factor)
-            else:
-                # Background image OVER QR code (tinted modules)
-                result = self.processor.image_over_qr_with_tinting(qr_image, self.bg_image, fade_factor=fade_factor)
-        else:
-            result = qr_image.convert('RGB')
-        
-        self.current_result = result
-        
-        # Update preview
-        pixmap = self.image_to_pixmap(result)
-        scaled_pixmap = pixmap.scaled(500, 500, Qt.AspectRatioMode.KeepAspectRatio)
+        # Update preview widget with result
         if self.preview_widget:
+            pixmap = self.image_to_pixmap(result)
+            scaled_pixmap = pixmap.scaled(500, 500, Qt.AspectRatioMode.KeepAspectRatio)
             self.preview_widget.setPixmap(scaled_pixmap)
+            # Update border style to show successful generation
             self.preview_widget.setStyleSheet(
                 "border: 2px solid green; background-color: white; min-width: 400px; min-height: 400px;"
             )
@@ -880,7 +846,7 @@ class MainWindow(QMainWindow):
     
     def save_result(self):
         """
-        Save the generated QR code image.
+        Save the generated QR code image with current positioning settings.
         Auto-generates filename from URL domain or uses custom name.
         """
         if self.current_result is None:
